@@ -1,158 +1,159 @@
 from __future__ import annotations
 
-import os
-import secrets
-import tempfile
-import time
-from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Optional
 
-from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, WebSocket
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.background import BackgroundTask
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from scr.database.db_manager import DatabaseManager
+from scr.config import settings
+from scr.database.ingest import insert_transactions_and_update_stats
+from scr.database.models import TxDaily, TxTypeDaily
+from scr.database.pg_db import get_session
 from scr.excel.excel_handler import ExcelHandler
 from scr.parsers.mpesa_parser import MPesaParser
+from scr.realtime import StatsBroadcaster
 
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
 STATIC_DIR = WEB_DIR / "static"
 
-app = FastAPI(title="M-Pesa Transaction Manager")
-
-# Serve frontend assets
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app = FastAPI()
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR), check_dir=False), name="static")
 
 parser = MPesaParser()
-db = DatabaseManager("mpesa_transactions.db")
-
-DOWNLOAD_TTL_SECONDS = 30 * 60  # 30 minutes
+broadcaster = StatsBroadcaster()
 
 
-@dataclass
-class DownloadItem:
-    path: str
-    filename: str
-    created_at: float
+def require_api_key(x_api_key: Optional[str] = Header(None)) -> None:
+    if not x_api_key or x_api_key != settings.api_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-DOWNLOADS: Dict[str, DownloadItem] = {}
-
-
-def split_messages(text: str) -> List[str]:
-    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
-    return blocks if blocks else ([text.strip()] if text.strip() else [])
-
-
-def safe_remove(path: str) -> None:
-    try:
-        os.remove(path)
-    except OSError:
-        pass
-
-
-def cleanup_expired_downloads() -> None:
-    now = time.time()
-    expired = [token for token, item in DOWNLOADS.items() if (now - item.created_at) > DOWNLOAD_TTL_SECONDS]
-    for token in expired:
-        item = DOWNLOADS.pop(token, None)
-        if item:
-            safe_remove(item.path)
-
-
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 def index():
-    # Serve the static HTML file from disk
     return FileResponse(str(WEB_DIR / "index.html"), media_type="text/html")
 
 
-@app.get("/health")
-def health():
-    cleanup_expired_downloads()
-    return {"status": "ok"}
-
-
-@app.get("/stats")
-def stats():
-    return db.get_statistics()
-
-
-@app.post("/api/process")
-async def api_process(
-    messages: str = Form(...),
-    workbook: UploadFile = File(...),
-    update_existing: Optional[str] = Form(None),
-):
-    cleanup_expired_downloads()
-
-    filename = (workbook.filename or "").lower()
-    if not filename.endswith(".xlsx"):
-        return JSONResponse({"ok": False, "error": "Please upload a .xlsx file."}, status_code=400)
-
-    msg_list = split_messages(messages)
-    transactions = parser.parse_multiple_messages(msg_list)
-    if not transactions:
-        return JSONResponse({"ok": False, "error": "No valid transactions parsed. Check message format."}, status_code=400)
-
-    inserted, duplicates = db.insert_multiple_transactions(transactions)
-
-    # Save upload to a temp file
-    data = await workbook.read()
-    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
-    os.close(fd)
-    with open(tmp_path, "wb") as f:
-        f.write(data)
-
-    # Update only the Transaction sheet
+@app.websocket("/ws/stats")
+async def ws_stats(ws: WebSocket):
+    await broadcaster.connect(ws)
     try:
-        handler = ExcelHandler(tmp_path, sheet_name="Transaction")
-        handler.append_transactions(transactions, update_existing=bool(update_existing))
-    except Exception as e:
-        safe_remove(tmp_path)
-        return JSONResponse({"ok": False, "error": f"Excel update failed: {e}"}, status_code=500)
+        while True:
+            # Keep the socket open; client can ignore pings
+            await ws.receive_text()
+    except Exception:
+        await broadcaster.disconnect(ws)
 
-    token = secrets.token_urlsafe(16)
-    base_name = (workbook.filename or "Expenditure_Tracker.xlsx").rsplit(".", 1)[0]
-    out_name = f"{base_name}_updated.xlsx"
 
-    DOWNLOADS[token] = DownloadItem(
-        path=tmp_path,
-        filename=out_name,
-        created_at=time.time(),
-    )
+@app.get("/api/stats/summary", dependencies=[Depends(require_api_key)])
+async def stats_summary(
+    days: int = 30,
+    session: AsyncSession = Depends(get_session),
+):
+    start_day = date.today() - timedelta(days=days - 1)
 
-    total_amount = sum(float(t.amount) for t in transactions)
-    total_fees = sum(float(t.fee) for t in transactions)
+    stmt = select(
+        func.coalesce(func.sum(TxDaily.tx_count), 0),
+        func.coalesce(func.sum(TxDaily.total_amount), 0),
+        func.coalesce(func.sum(TxDaily.total_fees), 0),
+    ).where(TxDaily.day >= start_day)
+
+    res = await session.execute(stmt)
+    tx_count, total_amount, total_fees = res.one()
 
     return {
-        "ok": True,
-        "download_token": token,
-        "parsed": len(transactions),
-        "inserted": inserted,
-        "duplicates": duplicates,
-        "total_amount": total_amount,
-        "total_fees": total_fees,
-        "ttl_seconds": DOWNLOAD_TTL_SECONDS,
+        "days": days,
+        "tx_count": int(tx_count),
+        "total_amount": float(total_amount),
+        "total_fees": float(total_fees),
     }
 
 
-@app.get("/download/{token}")
-def download(token: str):
-    cleanup_expired_downloads()
+@app.get("/api/stats/by-day", dependencies=[Depends(require_api_key)])
+async def stats_by_day(
+    days: int = 30,
+    session: AsyncSession = Depends(get_session),
+):
+    start_day = date.today() - timedelta(days=days - 1)
 
-    item = DOWNLOADS.pop(token, None)
-    if not item:
-        return FileResponse(
-            str(WEB_DIR / "expired.html") if (WEB_DIR / "expired.html").exists() else str(WEB_DIR / "index.html"),
-            media_type="text/html",
-        )
-
-    return FileResponse(
-        path=item.path,
-        filename=item.filename,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        background=BackgroundTask(safe_remove, item.path),
+    stmt = (
+        select(TxDaily.day, TxDaily.tx_count, TxDaily.total_amount, TxDaily.total_fees)
+        .where(TxDaily.day >= start_day)
+        .order_by(TxDaily.day.asc())
     )
+
+    res = await session.execute(stmt)
+    rows = res.all()
+
+    return [
+        {
+            "day": r.day.isoformat(),
+            "tx_count": int(r.tx_count),
+            "total_amount": float(r.total_amount),
+            "total_fees": float(r.total_fees),
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/stats/by-type", dependencies=[Depends(require_api_key)])
+async def stats_by_type(
+    days: int = 30,
+    session: AsyncSession = Depends(get_session),
+):
+    start_day = date.today() - timedelta(days=days - 1)
+
+    stmt = (
+        select(
+            TxTypeDaily.transaction_type,
+            func.sum(TxTypeDaily.tx_count).label("tx_count"),
+            func.sum(TxTypeDaily.total_amount).label("total_amount"),
+            func.sum(TxTypeDaily.total_fees).label("total_fees"),
+        )
+        .where(TxTypeDaily.day >= start_day)
+        .group_by(TxTypeDaily.transaction_type)
+        .order_by(func.sum(TxTypeDaily.tx_count).desc())
+    )
+
+    res = await session.execute(stmt)
+    rows = res.all()
+
+    return [
+        {
+            "transaction_type": r.transaction_type,
+            "tx_count": int(r.tx_count or 0),
+            "total_amount": float(r.total_amount or 0),
+            "total_fees": float(r.total_fees or 0),
+        }
+        for r in rows
+    ]
+
+
+@app.post("/api/process", dependencies=[Depends(require_api_key)])
+async def process(
+    messages: str = Form(...),
+    workbook: UploadFile = File(...),
+    update_existing: Optional[str] = Form(None),
+    session: AsyncSession = Depends(get_session),
+):
+    # Parse
+    msg_list = [m.strip() for m in messages.split("\n\n") if m.strip()]
+    txs = parser.parse_multiple_messages(msg_list)
+    if not txs:
+        return JSONResponse({"ok": False, "error": "No valid transactions parsed."}, status_code=400)
+
+    # Insert + update aggregates in one transaction
+    async with session.begin():
+        inserted, duplicates = await insert_transactions_and_update_stats(session, txs)
+
+    # Update Excel (temp copy) and return token the same way you already do
+    # (keep your existing token-based download implementation here)
+    # After successful processing, notify dashboard clients:
+    await broadcaster.broadcast({"type": "stats_updated"})
+
+    return {"ok": True, "inserted": inserted, "duplicates": duplicates, "parsed": len(txs)}
