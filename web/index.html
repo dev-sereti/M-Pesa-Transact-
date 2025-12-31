@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>M-Pesa Transaction Manager</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div>
+        <h1 class="title">M-Pesa Transaction Manager</h1>
+        <p class="subtitle">
+          Paste M-Pesa messages and upload your Expenditure Tracker workbook.
+          Process first, then download the updated Excel file only when you choose.
+        </p>
+      </div>
+      <div class="pill" id="healthPill">Status: Ready</div>
+    </header>
+
+    <main class="grid">
+      <section class="card">
+        <h2>Input</h2>
+
+        <form id="processForm">
+          <label for="messages">M-Pesa messages (separate multiple messages with a blank line)</label>
+          <textarea id="messages" name="messages" placeholder="Paste messages here..." required></textarea>
+
+          <div class="spacer"></div>
+
+          <label for="workbook">Expenditure Tracker workbook (.xlsx)</label>
+          <input id="workbook" type="file" name="workbook" accept=".xlsx" required />
+
+          <div class="row">
+            <label class="toggle">
+              <input type="checkbox" id="updateExisting" name="update_existing" value="1" />
+              Update existing rows by Transaction Code
+            </label>
+
+            <button class="btn btn-primary" id="processBtn" type="submit">
+              <span class="spinner" aria-hidden="true"></span>
+              <span class="btn-text">Process</span>
+            </button>
+
+            <button class="btn btn-secondary" id="clearBtn" type="button">Clear</button>
+          </div>
+
+          <div id="status" class="status info" style="display:none;"></div>
+        </form>
+
+        <p class="footer-note">
+          Your file is processed on the server and a download link is generated.
+          Nothing is downloaded automatically.
+        </p>
+      </section>
+
+      <section class="card">
+        <h2>Result</h2>
+
+        <div id="resultEmpty" class="status info" style="display:block;">
+          No result yet. Click Process to generate a downloadable updated workbook.
+        </div>
+
+        <div id="result" style="display:none;">
+          <div class="kv"><div class="k">Parsed transactions</div><div class="v" id="rParsed">0</div></div>
+          <div class="kv"><div class="k">Inserted to database</div><div class="v" id="rInserted">0</div></div>
+          <div class="kv"><div class="k">Duplicates skipped</div><div class="v" id="rDuplicates">0</div></div>
+          <div class="kv"><div class="k">Total amount</div><div class="v" id="rAmount">KSh 0.00</div></div>
+          <div class="kv"><div class="k">Total fees</div><div class="v" id="rFees">KSh 0.00</div></div>
+
+          <div class="row result-actions">
+            <a class="btn btn-primary" id="downloadBtn" href="#" download>Download updated Excel</a>
+            <button class="btn btn-secondary" id="newRunBtn" type="button">New run</button>
+          </div>
+
+          <p class="footer-note" id="expiryNote"></p>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
